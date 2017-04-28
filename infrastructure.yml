@@ -1,0 +1,181 @@
+# Playbook to create an AWS cluster, which has the following resources:
+#   - VPC: public and private subnets, internet gateway, nat gateway
+#   - EC2 instances for private and public subnets
+#   - ELB for public instances
+# You can change resources defaults in group_vars/all.yml or by adding a
+# separate vars file per environment and a separate inventory based on the
+# vars file, check 'infrastructure_stage' for example.
+#
+# Note: If you run the playbook you ensure idempotency for your EC2 instances,
+# meaning that they will not be created if are already created, only in the
+# same day as their creation day, otherwise new EC2 instances will be created.
+#
+# Create a default infrastructure with an ELB for public instances
+# ansible-playbook -i inventory/stage/infrastructure infrastructure.yml -e infra_create_elb=true
+#
+# Create a default infrastructure without an ELB
+# ansible-playbook -i inventory/dev/infrastructure infrastructure.yml
+#
+# Delete resources
+# ansible-playbook -i inventory/dev/infrastructure infrastructure.yml -e infra_state=absent
+#
+# Create resources in another region
+# ansible-playbook -i inventory/dev/infrastructure infrastructure.yml -e aws_region=us-east-1
+#     check group_vars/all.yml for more.
+#
+- hosts: local
+
+  vars:
+    state: "{{ infra_state | default('present') }}"
+    ec2_state: "{{ infra_ec2_state | default('present') }}"
+    create_elb: "{{ infra_create_elb | default('false') | bool }}"
+
+  tasks:
+    - name: "Ensure VPC is {{ state }}"
+      ec2_vpc_net:
+        name: "{{ infra.stack_name }}"
+        cidr_block: "{{ infra.cidr | default('10.10.0.0/16') }}"
+        region: "{{ infra.region }}"
+        state: "{{ state }}"
+      register: vpc
+
+    - set_fact: vpc="{{ vpc.vpc }}"
+
+    - name: "Ensure Internet Gateway is {{ state }}"
+      ec2_vpc_igw:
+        vpc_id: "{{ vpc.id }}"
+        region: "{{ infra.region }}"
+        state: "{{ state }}"
+
+    - name: Fetch Internet GW information from AWS
+      ec2_vpc_igw_facts:
+        region: "{{ infra.region }}"
+        filters:
+          "attachment.vpc-id": "{{ vpc.id }}"
+      register: internet_gateways
+
+    - set_fact: internet_gateway={{ internet_gateways.internet_gateways[0] }}
+
+    - name: "Ensure a private subnet is {{ state }} and register it as variable"
+      ec2_vpc_subnet:
+        vpc_id: "{{ vpc.id }}"
+        cidr: "{{ infra.private_subnet.cidr | default('10.10.1.0/24') }}"
+        region: "{{ infra.region }}"
+        az: "{{ infra.private_subnet.az }}"
+        resource_tags:
+          Name: "{{ infra.stack_name }}-Private Subnet"
+        state: "{{ state }}"
+      register: private_subnet
+
+    - set_fact: private_subnet={{ private_subnet.subnet }}
+
+    - name: "Ensure a public subnet is {{ state }} and register it as variable"
+      ec2_vpc_subnet:
+        vpc_id: "{{ vpc.id }}"
+        cidr: "{{ infra.public_subnet.cidr | default('10.10.2.0/24') }}"
+        region: "{{ infra.region }}"
+        az: "{{ infra.public_subnet.az }}"
+        resource_tags:
+          Name: "{{ infra.stack_name }}-Public Subnet"
+        state: "{{ state }}"
+      register: public_subnet
+
+    - set_fact: public_subnet={{ public_subnet.subnet }}
+
+    - name: "Ensure NAT gateway is {{ state }}"
+      ec2_vpc_nat_gateway:
+        subnet_id: "{{ public_subnet.id }}"
+        region: "{{ infra.region }}"
+        if_exist_do_not_create: yes
+        state: "{{ state }}"
+      register: nat_gateway
+
+    - name: Wait until NAT gateway is available
+      pause: seconds=60
+
+    - name: "Ensure private subnet route table is {{ state }}"
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc.id }}"
+        region: "{{ infra.region }}"
+        subnets:
+          - "{{ private_subnet.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ nat_gateway.nat_gateway_id }}"
+        tags:
+          Name: "{{ infra.stack_name }}-Private"
+        state: "{{ state }}"
+      register: private_route_table
+
+    - name: "Ensure public subnet route table is {{ state }}"
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc.id }}"
+        region: "{{ infra.region }}"
+        subnets:
+          - "{{ public_subnet.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ internet_gateway.internet_gateway_id }}"
+        tags:
+          Name: "{{ infra.stack_name }}-Public"
+        state: "{{ state }}"
+      register: public_route_table
+
+    - name: "Ensure Application Security Groups have state {{ state }}"
+      ec2_group:
+        name: "{{ vpc.id }}-{{ item.name }}"
+        description: "{{ item.description }}"
+        vpc_id: "{{ vpc.id }}"
+        region: "{{ infra.region }}"
+        rules: "{{ item.rules }}"
+        state: "{{ state }}"
+      with_items: "{{ infra.security_groups }}"
+
+    - name: "Ensure private EC2 instances have {{ ec2_state }} state"
+      ec2:
+        id: "{{ vpc.id }}-{{ private_subnet.id }}-{{ ansible_date_time.date }}"
+        instance_type: "{{ infra.ec2.private.instance_type }}"
+        image: "{{ infra.ec2.private.image }}"
+        region: "{{ infra.region }}"
+        wait: yes
+        vpc_subnet_id: "{{ private_subnet.id }}"
+        assign_public_ip: no
+        key_name: "{{ infra.ec2.private.key_name }}"
+        count: "{{ infra.ec2.private.count }}"
+        instance_tags: "{{ infra.ec2.private.instance_tags }}"
+        state: "{{ ec2_state }}"
+
+    - name: "Ensure public EC2 instances have {{ ec2_state }} state"
+      ec2:
+        id: "{{ vpc.id }}-{{ public_subnet.id }}-{{ ansible_date_time.date }}"
+        instance_type: "{{ infra.ec2.public.instance_type }}"
+        image: "{{ infra.ec2.public.image }}"
+        region: "{{ infra.region }}"
+        wait: yes
+        vpc_subnet_id: "{{ public_subnet.id }}"
+        assign_public_ip: yes
+        key_name: "{{ infra.ec2.public.key_name }}"
+        count: "{{ infra.ec2.public.count }}"
+        instance_tags: "{{ infra.ec2.public.instance_tags }}"
+        state: "{{ ec2_state }}"
+
+    - name: Get public EC2 instances IDs
+      ec2_remote_facts:
+        region: "{{ infra.region }}"
+        filters:
+          "subnet-id": "{{ public_subnet.id }}"
+          "vpc-id": "{{ vpc.id }}"
+      register: public_instances
+
+    - set_fact: public_instance_ids={{ item }}
+      with_items: "{{ public_instances.instances[0] | json_query('id') }}"
+
+    - name: "Ensure ELB is {{ ec2_state }}"
+      ec2_elb_lb:
+        name: "{{ infra.stack_name }}{{ infra.elb.name }}"
+        region: "{{ infra.region }}"
+        subnets: "{{ public_subnet.id }}"
+        listeners: "{{ infra.elb.listeners }}"
+        instance_ids: "{{ public_instance_ids }}"
+        health_check: "{{ infra.elb.health_check }}"
+        state: "{{ ec2_state }}"

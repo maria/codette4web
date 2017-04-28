@@ -1,0 +1,57 @@
+# Default AWS region and EC2 KeyPair name, you can overwritte the defaults by
+# setting from the CLI the variable `-e aws_region=us-east-1`.
+default_aws_region: "{{ aws_region | default('') }}"
+default_ec2_key_name: "{{ ec2_key_name | default('') }}"
+default_ec2_ami: "{{ ec2_ami | default('') }}"
+
+# Defaults for creating an AWS cluster
+infra:
+  stack_name: CodetteVPC
+  region: "{{ default_aws_region }}"
+  az: "{{ default_aws_region }}a"
+  private_subnet:
+    az: "{{ default_aws_region }}a"
+  public_subnet:
+    az: "{{ default_aws_region }}b"
+  ec2:
+    private:
+        instance_type: t2.micro
+        count: "{{ ec2_instances_count | default(1) }}"
+        image: "{{ default_ec2_ami }}"
+        key_name: "{{ default_ec2_key_name }}"
+        instance_tags:
+          stack: Codette
+          type: private
+    public:
+        instance_type: t2.micro
+        count: "{{ ec2_instances_count | default(1) }}"
+        image: "{{ default_ec2_ami }}"
+        key_name: "{{ default_ec2_key_name }}"
+        instance_tags:
+          stack: Codette
+          type: public
+  elb:
+    name: PublicELB
+    zones:
+      - "{{ default_aws_region }}b"
+    listeners:
+      - protocol: http
+        load_balancer_port: 80
+        instance_port: 80
+        proxy_protocol: True
+    health_check:
+        ping_protocol: http
+        ping_port: 80
+        ping_path: "/"
+        response_timeout: 5 # seconds
+        interval: 10 # seconds
+        unhealthy_threshold: 2
+        healthy_threshold: 10
+  security_groups:
+    - name: WebAccess
+      description: Web and SSH Access
+      rules:
+        - proto: tcp
+          from_port: 80
+          to_port: 80
+          cidr_ip: 0.0.0.0/0
